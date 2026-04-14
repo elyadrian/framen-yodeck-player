@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Framen Ad Player</title>
+<style>
+  /* ===== BASIC STYLING ===== */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+
+  /* Both video elements fill the screen */
+  video {
+    width: 100%; height: 100%;
+    object-fit: contain;
+    position: absolute; top: 0; left: 0;
+  }
+
+  /* For HTML news content (iframes) */
+  iframe {
+    width: 100%; height: 100%;
+    position: absolute; top: 0; left: 0;
+    border: none;
+  }
+
+  /* Status message shown when loading or no ads available */
+  #msg {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    color: #fff; font-family: sans-serif; font-size: 18px;
+    z-index: 10;
+  }
+
+  /* Debug log overlay - toggle with 'D' key */
+  #debug {
+    position: fixed; bottom: 0; left: 0;
+    width: 100%; max-height: 30%;
+    background: rgba(0,0,0,0.85);
+    color: #0f0; font-family: monospace; font-size: 11px;
+    padding: 8px; overflow-y: auto;
+    z-index: 100; display: none;
+  }
+</style>
+</head>
+<body>
+
+<!-- Two video elements for smooth transitions -->
+<video id="v1" muted autoplay playsinline></video>
+<video id="v2" muted playsinline style="display:none"></video>
+
+<!-- Iframe for HTML news content -->
+<iframe id="newsFrame" style="display:none"></iframe>
+
+<!-- Loading/status message -->
+<div id="msg">Loading...</div>
+
+<!-- Debug log panel (press D to show/hide) -->
+<div id="debug"></div>
+
+<script>
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+// Your Framen organization token
+var ORG_TOKEN = "Org_2E7a3bJRHHf";
+
+// Get screen ID from the URL: ?screen=YOUR_SCREEN_ID
+var params = new URLSearchParams(window.location.search);
+var SCREEN_ID = params.get("screen");
+
+// How long to wait before retrying when no ad is available (milliseconds)
+var RETRY_DELAY = 30000; // 30 seconds
+
+// How long to show HTML news items (milliseconds)
+var NEWS_DISPLAY_TIME = 15000; // 15 seconds
+
+// ============================================================
+// LOGGING SYSTEM
+// Shows logs in the debug panel AND in the browser console.
+// Press 'D' on your keyboard to show/hide the debug panel.
+// ============================================================
+
+var debugEl = document.getElementById("debug");
+var logLines = [];
+
+function log(message) {
+  var now = new Date();
+  var time = now.toLocaleTimeString() + "." + String(now.getMilliseconds()).padStart(3, "0");
+  var line = "[" + time + "] " + message;
+
+  // Print to browser console (open with F12 > Console tab)
+  console.log(line);
+
+  // Add to debug panel on screen
+  logLines.push(line);
+  if (logLines.length > 50) logLines.shift();
+  debugEl.innerHTML = logLines.join("<br>");
+  debugEl.scrollTop = debugEl.scrollHeight;
+}
+
+// Press 'D' to toggle the debug panel
+document.addEventListener("keydown", function(e) {
+  if (e.key === "d" || e.key === "D") {
+    debugEl.style.display = debugEl.style.display === "none" ? "block" : "none";
+  }
+});
+
+// ============================================================
+// TRACKING — THE KEY FIX!
+//
+// OLD CODE USED: XMLHttpRequest -> BLOCKED by CORS
+// NEW CODE USES: Image beacon  -> BYPASSES CORS
+//
+// This is the industry-standard way to fire tracking pixels.
+// The browser loads the URL as if it were an image, which
+// doesn't care about CORS. Framen's server gets the request
+// and counts the impression.
+// ============================================================
+
+function firePopUrl(url, label) {
+  if (!url) {
+    log("WARNING: No pop URL to fire for: " + (label || "unknown"));
+    return;
+  }
+
+  log("FIRE POP URL (" + (label || "tracking") + ")");
+  log("   URL: " + url.substring(0, 100) + "...");
+
+  // METHOD 1: Image beacon (primary — works cross-origin always)
+  try {
+    var img = new Image();
+    img.onload = function() {
+      log("POP SUCCESS (image loaded) — " + (label || ""));
+    };
+    img.onerror = function() {
+      // "error" is NORMAL for tracking pixels — the server returns
+      // a non-image response, but the request STILL went through!
+      log("POP SENT (image onerror is normal for tracking pixels) — " + (label || ""));
+    };
+    img.src = url;
+  } catch (e) {
+    log("ERROR: Image beacon failed: " + e.message);
+  }
+
+  // METHOD 2: sendBeacon (backup — also bypasses CORS)
+  try {
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(url);
+      log("POP ALSO SENT via sendBeacon (backup)");
+    }
+  } catch (e) {
+    log("sendBeacon backup failed (not critical): " + e.message);
+  }
+
+  // METHOD 3: fetch with no-cors (another backup)
+  try {
+    fetch(url, { mode: "no-cors", cache: "no-store" }).then(function() {
+      log("POP ALSO SENT via fetch no-cors (backup)");
+    }).catch(function() {
+      // This is fine — no-cors fetch can't read the response
+    });
+  } catch (e) {
+    // fetch not available, no problem — other methods cover it
+  }
+}
+
+// ============================================================
+// FRAMEN API: FETCH THE NEXT AD
+// ============================================================
+
+var API_URL = "https://api.framen.com/v3/vendor/" + ORG_TOKEN + "/1/rt_ad/" + SCREEN_ID;
+
+function fetchNextAd(callback) {
+  log("Fetching next ad from Framen...");
+
+  var x = new XMLHttpRequest();
+  x.open("GET", API_URL, true);
+
+  x.onload = function() {
+    log("Framen responded with status: " + x.status);
+
+    try {
+      var response = JSON.parse(x.responseText);
+      var data = response.data;
+
+      if (!data) {
+        log("WARNING: Response has no 'data' field");
+        callback(null);
+        return;
+      }
+
+      log("   requestId: " + (data.requestId || "none"));
+      log("   Has ad: " + (data.ad ? "YES" : "no"));
+      log("   Has news: " + (data.news ? "YES" : "no"));
+      log("   newsFirst: " + (data.newsFirst ? "YES" : "no"));
+
+      // Pick first available item (respecting newsFirst)
+      var item = null;
+
+      if (data.newsFirst && data.news) {
+        item = buildItem(data.news, "news");
+      } else if (data.ad) {
+        item = buildItem(data.ad, "ad");
+      } else if (data.news) {
+        item = buildItem(data.news, "news");
+      }
+
+      if (item) {
+        log("NEXT ITEM: " + item.type + " — " + item.title);
+        log("   MIME: " + item.mimeType);
+        log("   Duration: " + item.duration + "ms");
+        log("   Pop URL: " + (item.pop ? "YES" : "NO"));
+      } else {
+        log("WARNING: No playable items in response");
+      }
+
+      callback(item);
+
+    } catch (e) {
+      log("ERROR parsing Framen response: " + e.message);
+      log("   Raw: " + x.responseText.substring(0, 200));
+      callback(null);
+    }
+  };
+
+  x.onerror = function() {
+    log("ERROR: Network error fetching ad from Framen");
+    callback(null);
+  };
+
+  x.ontimeout = function() {
+    log("ERROR: Timeout fetching ad from Framen");
+    callback(null);
+  };
+
+  x.timeout = 15000;
+  x.send();
+}
+
+// Helper: build a standardized item object
+function buildItem(data, type) {
+  return {
+    type: type,
+    title: data.title || "Untitled",
+    mimeType: data.mimeType || "",
+    url: data.url || null,
+    pop: data.pop || null,
+    duration: data.duration || 15000,
+    width: data.width || 1920,
+    height: data.height || 1080
+  };
+}
+
+// ============================================================
+// PLAYBACK ENGINE
+// ============================================================
+
+var msg = document.getElementById("msg");
+var videos = [document.getElementById("v1"), document.getElementById("v2")];
+var newsFrame = document.getElementById("newsFrame");
+var currentVideoIndex = 0;
+var popFired = false;
+
+function showMessage(text) {
+  msg.textContent = text;
+  msg.style.display = "block";
+}
+
+function hideMessage() {
+  msg.style.display = "none";
+}
+
+function hideAll() {
+  videos[0].style.display = "none";
+  videos[1].style.display = "none";
+  newsFrame.style.display = "none";
+  videos[0].pause();
+  videos[1].pause();
+}
+
+function playItem(item) {
+  if (!item || !item.url) {
+    log("No item to play, waiting " + (RETRY_DELAY / 1000) + "s...");
+    showMessage("No ad available. Retrying...");
+    setTimeout(startLoop, RETRY_DELAY);
+    return;
+  }
+
+  hideAll();
+  hideMessage();
+  popFired = false;
+
+  if (item.mimeType === "text/html") {
+    // ---- HTML NEWS CONTENT ----
+    log("Playing HTML news: " + item.title);
+    newsFrame.src = item.url;
+    newsFrame.style.display = "block";
+
+    var displayTime = item.duration || NEWS_DISPLAY_TIME;
+    log("   Will show for " + (displayTime / 1000) + " seconds");
+
+    setTimeout(function() {
+      if (!popFired) {
+        popFired = true;
+        firePopUrl(item.pop, "news: " + item.title);
+      }
+      newsFrame.style.display = "none";
+      newsFrame.src = "";
+      log("News finished, fetching next...");
+      startLoop();
+    }, displayTime);
+
+  } else if (item.mimeType && item.mimeType.startsWith("video/")) {
+    // ---- VIDEO AD CONTENT ----
+    log("Playing video: " + item.title);
+
+    var videoEl = videos[currentVideoIndex];
+    videoEl.src = item.url;
+    videoEl.style.display = "block";
+
+    var playPromise = videoEl.play();
+    if (playPromise) {
+      playPromise.catch(function(e) {
+        log("WARNING: Video play() rejected: " + e.message);
+        if (!popFired) {
+          popFired = true;
+          firePopUrl(item.pop, "play-error: " + item.title);
+        }
+        setTimeout(startLoop, 5000);
+      });
+    }
+
+    // Fire pop when video ends normally
+    videoEl.onended = function() {
+      log("Video ended: " + item.title);
+      if (!popFired) {
+        popFired = true;
+        firePopUrl(item.pop, "ended: " + item.title);
+      }
+      videoEl.style.display = "none";
+      currentVideoIndex = 1 - currentVideoIndex;
+      startLoop();
+    };
+
+    // If video errors, still fire pop and continue
+    videoEl.onerror = function() {
+      log("ERROR: Video error for: " + item.title);
+      if (!popFired) {
+        popFired = true;
+        firePopUrl(item.pop, "error: " + item.title);
+      }
+      videoEl.style.display = "none";
+      setTimeout(startLoop, 5000);
+    };
+
+    // Stall detection — if video is stuck after 2x its duration, skip it
+    var stallTimer = setTimeout(function() {
+      if (!popFired && videoEl.paused && videoEl.readyState < 3) {
+        log("WARNING: Video stalled: " + item.title);
+        popFired = true;
+        firePopUrl(item.pop, "stalled: " + item.title);
+        videoEl.style.display = "none";
+        startLoop();
+      }
+    }, Math.max(item.duration * 2, 30000));
+
+    var origOnended = videoEl.onended;
+    videoEl.onended = function() {
+      clearTimeout(stallTimer);
+      origOnended();
+    };
+
+  } else {
+    // ---- UNKNOWN TYPE — try as iframe ----
+    log("Unknown mimeType (" + item.mimeType + "), trying as iframe");
+    newsFrame.src = item.url;
+    newsFrame.style.display = "block";
+    setTimeout(function() {
+      if (!popFired) {
+        popFired = true;
+        firePopUrl(item.pop, "unknown: " + item.title);
+      }
+      newsFrame.style.display = "none";
+      startLoop();
+    }, item.duration || NEWS_DISPLAY_TIME);
+  }
+}
+
+// ============================================================
+// MAIN LOOP — fetch ad, play it, repeat forever
+// ============================================================
+
+function startLoop() {
+  fetchNextAd(function(item) {
+    if (item) {
+      playItem(item);
+    } else {
+      showMessage("No ad available. Retrying...");
+      log("Waiting " + (RETRY_DELAY / 1000) + "s before retry...");
+      setTimeout(startLoop, RETRY_DELAY);
+    }
+  });
+}
+
+// ============================================================
+// STARTUP
+// ============================================================
+
+if (!SCREEN_ID) {
+  showMessage("Error: No screen ID. Add ?screen=YOUR_SCREEN_ID to the URL");
+  log("ERROR: No screen ID in URL");
+} else {
+  log("===========================================");
+  log("FRAMEN AD PLAYER STARTING");
+  log("   Screen ID: " + SCREEN_ID);
+  log("   Org Token: " + ORG_TOKEN);
+  log("   Press D to toggle debug panel");
+  log("===========================================");
+  startLoop();
+}
+</script>
+</body>
+</html>
